@@ -1,153 +1,121 @@
 export default {
   async fetch(request, env, ctx) {
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Max-Age": "86400",
-    };
-
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, OPTIONS",
+          "Access-Control-Allow-Headers": "*"
+        }
+      });
     }
 
     const url = new URL(request.url);
-    const word = url.searchParams.get("word");
+    const word = url.searchParams.get("word")?.trim().toLowerCase();
 
     if (!word) {
-      return new Response(
-        JSON.stringify({ error: "Word parameter is required." }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    const cleanWord = word.trim().toLowerCase();
-
-    const cacheUrl = new URL(request.url);
-    const cacheKey = new Request(cacheUrl.toString(), request);
-    const cache = caches.default;
-
-    let response = await cache.match(cacheKey);
-    if (response) {
-      return response;
+      return new Response(JSON.stringify({ error: "No word provided" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
     }
 
     try {
-      let definition = "";
-      let partOfSpeech = "";
-      let phonetic = "";
-      let audio = "";
-      let synonyms = [];
+      // 1. Try Free Dictionary API first (provides audio MP3 & phonetics)
+      const dictRes = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`);
+      
+      if (dictRes.ok) {
+        const dictData = await dictRes.json();
+        const entry = dictData[0];
 
-      // Datamuse API
-      try {
-        const datamuseRes = await fetch(
-          `https://api.datamuse.com/words?sp=${encodeURIComponent(cleanWord)}&md=dp&max=1`
-        );
-        if (datamuseRes.ok) {
-          const data = await datamuseRes.json();
-          if (data && data.length > 0 && data[0].defs && data[0].defs.length > 0) {
-            const rawDef = data[0].defs[0];
-            const tabIndex = rawDef.indexOf("\t");
+        // Find the first audio file that is non-empty
+        let audioUrl = "";
+        let phoneticText = entry.phonetic || "";
 
-            if (tabIndex !== -1) {
-              const posTag = rawDef.substring(0, tabIndex).trim();
-              definition = rawDef.substring(tabIndex + 1).trim();
-
-              const posMap = {
-                n: "noun",
-                v: "verb",
-                adj: "adjective",
-                adv: "adverb",
-                u: "unknown",
-              };
-              partOfSpeech = posMap[posTag] || posTag;
-            } else {
-              definition = rawDef;
+        if (entry.phonetics && entry.phonetics.length > 0) {
+          const validAudio = entry.phonetics.find(p => p.audio && p.audio.trim() !== "");
+          if (validAudio) {
+            audioUrl = validAudio.audio;
+          }
+          if (!phoneticText) {
+            const validPhonetic = entry.phonetics.find(p => p.text && p.text.trim() !== "");
+            if (validPhonetic) {
+              phoneticText = validPhonetic.text;
             }
           }
         }
 
-        const synRes = await fetch(
-          `https://api.datamuse.com/words?rel_syn=${encodeURIComponent(cleanWord)}&max=5`
-        );
-        if (synRes.ok) {
-          const synData = await synRes.json();
-          if (Array.isArray(synData)) {
-            synonyms = synData.map((s) => s.word);
+        // Extract definition, part of speech, and synonyms
+        let definition = "";
+        let partOfSpeech = "";
+        let synonyms = [];
+
+        if (entry.meanings && entry.meanings.length > 0) {
+          const firstMeaning = entry.meanings[0];
+          partOfSpeech = firstMeaning.partOfSpeech || "";
+          
+          if (firstMeaning.definitions && firstMeaning.definitions.length > 0) {
+            definition = firstMeaning.definitions[0].definition || "";
+            synonyms = firstMeaning.definitions[0].synonyms?.slice(0, 5) || [];
+          }
+
+          if (synonyms.length === 0 && firstMeaning.synonyms) {
+            synonyms = firstMeaning.synonyms.slice(0, 5);
           }
         }
-      } catch (e) {}
 
-      // Free Dictionary API
-      try {
-        const dictRes = await fetch(
-          `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(cleanWord)}`
-        );
-        if (dictRes.ok) {
-          const dictData = await dictRes.json();
-          if (Array.isArray(dictData) && dictData.length > 0) {
-            const entry = dictData[0];
-            phonetic = entry.phonetic || "";
+        const payload = {
+          word: entry.word || word,
+          phonetic: phoneticText,
+          audio: audioUrl,
+          partOfSpeech: partOfSpeech,
+          definition: definition,
+          synonyms: synonyms
+        };
 
-            if (entry.phonetics && Array.isArray(entry.phonetics)) {
-              for (const p of entry.phonetics) {
-                if (!phonetic && p.text) phonetic = p.text;
-                if (p.audio && !audio) {
-                  audio = p.audio;
-                }
-              }
-            }
-
-            if (!definition && entry.meanings && entry.meanings.length > 0) {
-              const firstMeaning = entry.meanings[0];
-              if (!partOfSpeech) partOfSpeech = firstMeaning.partOfSpeech || "";
-
-              if (firstMeaning.definitions && firstMeaning.definitions.length > 0) {
-                definition = firstMeaning.definitions[0].definition || "";
-              }
-
-              if (synonyms.length === 0 && firstMeaning.synonyms) {
-                synonyms = [...new Set(firstMeaning.synonyms)].slice(0, 5);
-              }
-            }
+        return new Response(JSON.stringify(payload), {
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=86400"
           }
-        }
-      } catch (e) {}
-
-      if (!definition) {
-        return new Response(
-          JSON.stringify({ error: `Definition for '${word}' not found.` }),
-          { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
+        });
       }
 
-      const payload = {
-        word: cleanWord,
-        phonetic: phonetic,
-        audio: audio,
-        partOfSpeech: partOfSpeech,
-        definition: definition,
-        synonyms: synonyms,
-      };
+      // 2. Fallback to Datamuse if not found in Free Dictionary API
+      const datamuseRes = await fetch(`https://api.datamuse.com/words?sp=${encodeURIComponent(word)}&md=dp&max=1`);
+      const datamuseData = await datamuseRes.json();
 
-      response = new Response(JSON.stringify(payload), {
-        status: 200,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "application/json",
-          "Cache-Control": "public, max-age=86400",
-        },
+      if (datamuseData.length > 0 && datamuseData[0].defs) {
+        const defRaw = datamuseData[0].defs[0] || "";
+        const [pos, ...defParts] = defRaw.split("\t");
+
+        return new Response(JSON.stringify({
+          word: word,
+          phonetic: "",
+          audio: "",
+          partOfSpeech: pos || "",
+          definition: defParts.join(" "),
+          synonyms: []
+        }), {
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=86400"
+          }
+        });
+      }
+
+      return new Response(JSON.stringify({ error: `Definition for '${word}' not found.` }), {
+        status: 404,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
 
-      ctx.waitUntil(cache.put(cacheKey, response.clone()));
-
-      return response;
     } catch (err) {
-      return new Response(
-        JSON.stringify({ error: "Internal server error occurred." }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      return new Response(JSON.stringify({ error: "Internal Server Error" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
     }
-  },
+  }
 };
